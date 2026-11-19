@@ -23,7 +23,9 @@
 // It has a flatter structure than an equivalent red-black or other binary tree,
 // which in some cases yields better memory usage and/or performance.
 // See some discussion on the matter here:
-//   http://google-opensource.blogspot.com/2013/01/c-containers-that-save-memory-and-time.html
+//
+//	http://google-opensource.blogspot.com/2013/01/c-containers-that-save-memory-and-time.html
+//
 // Note, though, that this project is in no way related to the C++ B-Tree
 // implementation written about there.
 //
@@ -31,13 +33,14 @@
 // slice of children.  For basic numeric values or raw structs, this can cause
 // efficiency differences when compared to equivalent C++ template code that
 // stores values in arrays within the node:
-//   * Due to the overhead of storing values as interfaces (each
+//   - Due to the overhead of storing values as interfaces (each
 //     value needs to be stored as the value itself, then 2 words for the
 //     interface pointing to that value and its type), resulting in higher
 //     memory use.
-//   * Since interfaces can point to values anywhere in memory, values are
+//   - Since interfaces can point to values anywhere in memory, values are
 //     most likely not stored in contiguous blocks, resulting in a higher
 //     number of cache misses.
+//
 // These issues don't tend to matter, though, when working with strings or other
 // heap-allocated structures, since C++-equivalent structures also must store
 // pointers and also distribute their values across the heap.
@@ -242,8 +245,8 @@ func (s *children) truncate(index int) {
 // node is an internal node in a tree.
 //
 // It must at all times maintain the invariant that either
-//   * len(children) == 0, len(items) unconstrained
-//   * len(children) == len(items) + 1
+//   - len(children) == 0, len(items) unconstrained
+//   - len(children) == len(items) + 1
 type node struct {
 	items    items
 	children children
@@ -437,15 +440,20 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 // remove it.
 //
 // Most documentation says we have to do two sets of special casing:
-//   1) item is in this node
-//   2) item is in child
+//  1. item is in this node
+//  2. item is in child
+//
 // In both cases, we need to handle the two subcases:
-//   A) node has enough values that it can spare one
-//   B) node doesn't have enough values
+//
+//	A) node has enough values that it can spare one
+//	B) node doesn't have enough values
+//
 // For the latter, we have to check:
-//   a) left sibling has node to spare
-//   b) right sibling has node to spare
-//   c) we must merge
+//
+//	a) left sibling has node to spare
+//	b) right sibling has node to spare
+//	c) we must merge
+//
 // To simplify our code here, we handle cases #1 and #2 the same:
 // If a node doesn't have enough items, we make sure it does (using a,b,c).
 // We then simply redo our remove call, and the second time (regardless of
@@ -584,8 +592,12 @@ func (n *node) print(w io.Writer, level int) {
 // removal, and iteration.
 //
 // Write operations are not safe for concurrent mutation by multiple
-// goroutines, but Read operations are.
+// goroutines. A read operation may run concurrently with a write operation;
+// iterators operate on a point-in-time snapshot, so they observe either the
+// state before or after a concurrent modification, never a partially
+// modified node.
 type BTree struct {
+	mu     sync.RWMutex
 	degree int
 	length int
 	root   *node
@@ -610,9 +622,9 @@ type copyOnWriteContext struct {
 	freelist *FreeList
 }
 
-// Clone clones the btree, lazily.  Clone should not be called concurrently,
-// but the original tree (t) and the new tree (t2) can be used concurrently
-// once the Clone call completes.
+// Clone clones the btree, lazily.  Clone may be called concurrently with other
+// operations on t.  The original tree (t) and the new tree (t2) can be used
+// concurrently once the Clone call completes.
 //
 // The internal tree structure of b is marked read-only and shared between t and
 // t2.  Writes to both t and t2 use copy-on-write logic, creating new nodes
@@ -622,16 +634,40 @@ type copyOnWriteContext struct {
 // copies due to the aforementioned copy-on-write logic, but should converge to
 // the original performance characteristics of the original tree.
 func (t *BTree) Clone() (t2 *BTree) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cloneLocked()
+}
+
+// cloneLocked clones the tree.  The caller must hold t.mu.
+func (t *BTree) cloneLocked() (t2 *BTree) {
 	// Create two entirely new copy-on-write contexts.
 	// This operation effectively creates three trees:
 	//   the original, shared nodes (old b.cow)
 	//   the new b.cow nodes
 	//   the new out.cow nodes
 	cow1, cow2 := *t.cow, *t.cow
-	out := *t
+	out := &BTree{
+		degree: t.degree,
+		length: t.length,
+		root:   t.root,
+		cow:    &cow2,
+	}
 	t.cow = &cow1
-	out.cow = &cow2
-	return &out
+	return out
+}
+
+// snapshot returns a stable, point-in-time view of the tree for iteration.
+// Writes to t after the snapshot is taken copy nodes instead of mutating the
+// nodes referenced by the snapshot, so an in-progress split cannot truncate
+// content that an iterator is still reading.
+func (t *BTree) snapshot() *BTree {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.root == nil {
+		return nil
+	}
+	return t.cloneLocked()
 }
 
 // maxItems returns the max number of items to allow per node.
@@ -684,6 +720,8 @@ func (c *copyOnWriteContext) freeNode(n *node) freeType {
 //
 // nil cannot be added to the tree (will panic).
 func (t *BTree) ReplaceOrInsert(item Item) Item {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if item == nil {
 		panic("nil item being added to BTree")
 	}
@@ -712,18 +750,24 @@ func (t *BTree) ReplaceOrInsert(item Item) Item {
 // Delete removes an item equal to the passed in item from the tree, returning
 // it.  If no such item exists, returns nil.
 func (t *BTree) Delete(item Item) Item {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.deleteItem(item, removeItem)
 }
 
 // DeleteMin removes the smallest item in the tree and returns it.
 // If no such item exists, returns nil.
 func (t *BTree) DeleteMin() Item {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.deleteItem(nil, removeMin)
 }
 
 // DeleteMax removes the largest item in the tree and returns it.
 // If no such item exists, returns nil.
 func (t *BTree) DeleteMax() Item {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.deleteItem(nil, removeMax)
 }
 
@@ -747,78 +791,88 @@ func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 // AscendRange calls the iterator for every value in the tree within the range
 // [greaterOrEqual, lessThan), until iterator returns false.
 func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(ascend, greaterOrEqual, lessThan, true, false, iterator)
+	snapshot.root.iterate(ascend, greaterOrEqual, lessThan, true, false, iterator)
 }
 
 // AscendLessThan calls the iterator for every value in the tree within the range
 // [first, pivot), until iterator returns false.
 func (t *BTree) AscendLessThan(pivot Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(ascend, nil, pivot, false, false, iterator)
+	snapshot.root.iterate(ascend, nil, pivot, false, false, iterator)
 }
 
 // AscendGreaterOrEqual calls the iterator for every value in the tree within
 // the range [pivot, last], until iterator returns false.
 func (t *BTree) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(ascend, pivot, nil, true, false, iterator)
+	snapshot.root.iterate(ascend, pivot, nil, true, false, iterator)
 }
 
 // Ascend calls the iterator for every value in the tree within the range
 // [first, last], until iterator returns false.
 func (t *BTree) Ascend(iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(ascend, nil, nil, false, false, iterator)
+	snapshot.root.iterate(ascend, nil, nil, false, false, iterator)
 }
 
 // DescendRange calls the iterator for every value in the tree within the range
 // [lessOrEqual, greaterThan), until iterator returns false.
 func (t *BTree) DescendRange(lessOrEqual, greaterThan Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(descend, lessOrEqual, greaterThan, true, false, iterator)
+	snapshot.root.iterate(descend, lessOrEqual, greaterThan, true, false, iterator)
 }
 
 // DescendLessOrEqual calls the iterator for every value in the tree within the range
 // [pivot, first], until iterator returns false.
 func (t *BTree) DescendLessOrEqual(pivot Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(descend, pivot, nil, true, false, iterator)
+	snapshot.root.iterate(descend, pivot, nil, true, false, iterator)
 }
 
 // DescendGreaterThan calls the iterator for every value in the tree within
 // the range [last, pivot), until iterator returns false.
 func (t *BTree) DescendGreaterThan(pivot Item, iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(descend, nil, pivot, false, false, iterator)
+	snapshot.root.iterate(descend, nil, pivot, false, false, iterator)
 }
 
 // Descend calls the iterator for every value in the tree within the range
 // [last, first], until iterator returns false.
 func (t *BTree) Descend(iterator ItemIterator) {
-	if t.root == nil {
+	snapshot := t.snapshot()
+	if snapshot == nil {
 		return
 	}
-	t.root.iterate(descend, nil, nil, false, false, iterator)
+	snapshot.root.iterate(descend, nil, nil, false, false, iterator)
 }
 
 // Get looks for the key item in the tree, returning it.  It returns nil if
 // unable to find that item.
 func (t *BTree) Get(key Item) Item {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.root == nil {
 		return nil
 	}
@@ -827,21 +881,32 @@ func (t *BTree) Get(key Item) Item {
 
 // Min returns the smallest item in the tree, or nil if the tree is empty.
 func (t *BTree) Min() Item {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return min(t.root)
 }
 
 // Max returns the largest item in the tree, or nil if the tree is empty.
 func (t *BTree) Max() Item {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return max(t.root)
 }
 
 // Has returns true if the given key is in the tree.
 func (t *BTree) Has(key Item) bool {
-	return t.Get(key) != nil
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.root == nil {
+		return false
+	}
+	return t.root.get(key) != nil
 }
 
 // Len returns the number of items currently in the tree.
 func (t *BTree) Len() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.length
 }
 
@@ -858,14 +923,17 @@ func (t *BTree) Len() int {
 // one, instead of being lost to the garbage collector.
 //
 // This call takes:
-//   O(1): when addNodesToFreelist is false, this is a single operation.
-//   O(1): when the freelist is already full, it breaks out immediately
-//   O(freelist size):  when the freelist is empty and the nodes are all owned
-//       by this tree, nodes are added to the freelist until full.
-//   O(tree size):  when all nodes are owned by another tree, all nodes are
-//       iterated over looking for nodes to add to the freelist, and due to
-//       ownership, none are.
+//
+//	O(1): when addNodesToFreelist is false, this is a single operation.
+//	O(1): when the freelist is already full, it breaks out immediately
+//	O(freelist size):  when the freelist is empty and the nodes are all owned
+//	    by this tree, nodes are added to the freelist until full.
+//	O(tree size):  when all nodes are owned by another tree, all nodes are
+//	    iterated over looking for nodes to add to the freelist, and due to
+//	    ownership, none are.
 func (t *BTree) Clear(addNodesToFreelist bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.root != nil && addNodesToFreelist {
 		t.root.reset(t.cow)
 	}
