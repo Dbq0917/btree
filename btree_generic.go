@@ -28,7 +28,9 @@
 // It has a flatter structure than an equivalent red-black or other binary tree,
 // which in some cases yields better memory usage and/or performance.
 // See some discussion on the matter here:
-//   http://google-opensource.blogspot.com/2013/01/c-containers-that-save-memory-and-time.html
+//
+//	http://google-opensource.blogspot.com/2013/01/c-containers-that-save-memory-and-time.html
+//
 // Note, though, that this project is in no way related to the C++ B-Tree
 // implementation written about there.
 //
@@ -36,13 +38,14 @@
 // slice of children.  For basic numeric values or raw structs, this can cause
 // efficiency differences when compared to equivalent C++ template code that
 // stores values in arrays within the node:
-//   * Due to the overhead of storing values as interfaces (each
+//   - Due to the overhead of storing values as interfaces (each
 //     value needs to be stored as the value itself, then 2 words for the
 //     interface pointing to that value and its type), resulting in higher
 //     memory use.
-//   * Since interfaces can point to values anywhere in memory, values are
+//   - Since interfaces can point to values anywhere in memory, values are
 //     most likely not stored in contiguous blocks, resulting in a higher
 //     number of cache misses.
+//
 // These issues don't tend to matter, though, when working with strings or other
 // heap-allocated structures, since C++-equivalent structures also must store
 // pointers and also distribute their values across the heap.
@@ -159,6 +162,10 @@ func NewWithFreeListG[T any](degree int, less LessFunc[T], f *FreeListG[T]) *BTr
 	return &BTreeG[T]{
 		degree: degree,
 		cow:    &copyOnWriteContext[T]{freelist: f, less: less},
+		// Automatic compaction is opt-in: a plain tree (including Clones
+		// sharing a freelist) keeps Delete cheap and allocation-free, while
+		// workloads that bulk-delete can enable it or call Compact directly.
+		compactThreshold: 0,
 	}
 }
 
@@ -224,8 +231,8 @@ func (s items[T]) find(item T, less func(T, T) bool) (index int, found bool) {
 // node is an internal node in a tree.
 //
 // It must at all times maintain the invariant that either
-//   * len(children) == 0, len(items) unconstrained
-//   * len(children) == len(items) + 1
+//   - len(children) == 0, len(items) unconstrained
+//   - len(children) == len(items) + 1
 type node[T any] struct {
 	items    items[T]
 	children items[*node[T]]
@@ -420,15 +427,20 @@ func (n *node[T]) remove(item T, minItems int, typ toRemove) (_ T, _ bool) {
 // remove it.
 //
 // Most documentation says we have to do two sets of special casing:
-//   1) item is in this node
-//   2) item is in child
+//  1. item is in this node
+//  2. item is in child
+//
 // In both cases, we need to handle the two subcases:
-//   A) node has enough values that it can spare one
-//   B) node doesn't have enough values
+//
+//	A) node has enough values that it can spare one
+//	B) node doesn't have enough values
+//
 // For the latter, we have to check:
-//   a) left sibling has node to spare
-//   b) right sibling has node to spare
-//   c) we must merge
+//
+//	a) left sibling has node to spare
+//	b) right sibling has node to spare
+//	c) we must merge
+//
 // To simplify our code here, we handle cases #1 and #2 the same:
 // If a node doesn't have enough items, we make sure it does (using a,b,c).
 // We then simply redo our remove call, and the second time (regardless of
@@ -585,7 +597,24 @@ type BTreeG[T any] struct {
 	length int
 	root   *node[T]
 	cow    *copyOnWriteContext[T]
+	// deletesSinceCompact counts successful Delete calls since the last
+	// structural compaction. Deleting many items leaves behind half-empty
+	// nodes and unnecessarily deep paths even though the tree stays
+	// consistent; compaction rebuilds the surviving items into the fewest,
+	// fullest nodes once the accumulated drift is large enough, instead of
+	// paying that cost on every Delete.
+	deletesSinceCompact int
+	// compactThreshold triggers an automatic Compact when
+	// deletesSinceCompact reaches it. A value <= 0 disables automatic
+	// compaction; Compact can still be called explicitly.
+	compactThreshold int
 }
+
+// defaultCompactThresholdDivisor sets the automatic-compaction cadence as a
+// fraction of the current tree size (see compactThresholdFor): a rebuild runs
+// after roughly length/divisor deletions. Scaling with length keeps the O(n)
+// rebuild amortized against O(n) deletions instead of landing on every Delete.
+const defaultCompactThresholdDivisor = 4
 
 // LessFunc[T] determines how to order a type 'T'.  It should implement a strict
 // ordering, and should return true if within that ordering, 'a' < 'b'.
@@ -739,8 +768,236 @@ func (t *BTreeG[T]) deleteItem(item T, typ toRemove) (_ T, _ bool) {
 	}
 	if outb {
 		t.length--
+		t.deletesSinceCompact++
+		t.maybeCompact()
 	}
 	return out, outb
+}
+
+// compactThresholdFor returns the number of accumulated deletions that justify
+// a rebuild at the current tree size. Scaling with the length keeps the
+// amortized cost of automatic compaction bounded: a rebuild is O(n) but only
+// happens after O(n) deletions, so each Delete stays O(log n) amortized.
+func (t *BTreeG[T]) compactThresholdFor() int {
+	if t.compactThreshold <= 0 {
+		return 0
+	}
+	threshold := t.length / t.compactThreshold
+	if threshold < 1 {
+		threshold = 1
+	}
+	return threshold
+}
+
+// maybeCompact rebuilds the tree once enough deletions have accumulated to
+// make the structural drift worthwhile. It is a no-op when automatic
+// compaction is disabled (SetAutoCompact(false)) or before the threshold is
+// reached, so the common Delete path only pays for a counter increment.
+func (t *BTreeG[T]) maybeCompact() {
+	threshold := t.compactThresholdFor()
+	if threshold > 0 && t.deletesSinceCompact >= threshold {
+		t.Compact()
+	}
+}
+
+// SetAutoCompact toggles automatic structural compaction after bulk
+// deletions. When enabled, the tree periodically rebuilds itself so that
+// query paths stay close to the minimum height for the number of surviving
+// items. Automatic compaction is disabled by default to keep Delete cheap
+// and allocation-free; in that mode Delete only removes items and leaves the
+// node layout untouched, so call Compact manually at a convenient point to
+// reclaim the structure.
+//
+// Automatic compaction never changes item ordering: ascending/descending
+// iteration produces exactly the same sequence before and after a rebuild.
+func (t *BTreeG[T]) SetAutoCompact(enabled bool) {
+	if enabled {
+		t.compactThreshold = defaultCompactThresholdDivisor
+	} else {
+		t.compactThreshold = 0
+	}
+}
+
+// AutoCompact reports whether automatic structural compaction is enabled.
+func (t *BTreeG[T]) AutoCompact() bool {
+	return t.compactThreshold > 0
+}
+
+// Compact rebuilds the tree from its current items so that every node is as
+// full as possible and the tree occupies its minimum height. This reclaims
+// the half-empty nodes left behind by large-scale deletions, shortening query
+// paths back to what a freshly built tree of the same size would have.
+//
+// Compact is O(n) in the number of items and does not change the set of
+// items or their iteration order. It is normally invoked automatically after
+// enough deletions accumulate, but can be called explicitly at a convenient
+// point (for example, after a batch delete window) to control when the
+// rebuild cost is paid. Compacting an empty or single-node tree is cheap.
+func (t *BTreeG[T]) Compact() {
+	t.deletesSinceCompact = 0
+	if t.root == nil || len(t.root.children) == 0 {
+		return
+	}
+
+	// Collect items in sorted order via an iterative in-order walk. This is a
+	// classic B-tree: every node stores data items, and an internal node's
+	// items are emitted between its children (child0, item0, child1, item1,
+	// ..., itemK-1, childK). An explicit stack of visit steps avoids recursion
+	// depth proportional to the (potentially stale) height.
+	sorted := make(items[T], 0, t.length)
+	type frame struct {
+		n    *node[T]
+		item bool
+		pos  int
+	}
+	stack := []frame{{n: t.root}}
+	for len(stack) > 0 {
+		top := len(stack) - 1
+		step := stack[top]
+		stack = stack[:top]
+		n := step.n
+		if step.item {
+			sorted = append(sorted, n.items[step.pos])
+			continue
+		}
+		// Push in reverse so the smallest element is on top: walk the
+		// interleaved child/item sequence from right to left.
+		for i := len(n.items) - 1; i >= 0; i-- {
+			if i+1 < len(n.children) {
+				stack = append(stack, frame{n: n.children[i+1]})
+			}
+			stack = append(stack, frame{n: n, item: true, pos: i})
+		}
+		if len(n.children) > 0 {
+			stack = append(stack, frame{n: n.children[0]})
+		}
+	}
+
+	// Build the replacement subtree through a private, empty freelist so the
+	// rebuild never reuses a node still referenced by the old tree or by a
+	// Clone sharing t's freelist. The new nodes are then re-stamped with t's
+	// write context so they remain directly mutable on subsequent writes. The
+	// previous subtree is dropped (normal GC) rather than recycled, which
+	// keeps this correct regardless of subtree size.
+	privateCow := &copyOnWriteContext[T]{
+		freelist: NewFreeListG[T](0),
+		less:     t.cow.less,
+	}
+	newRoot := t.bulkLoadWith(sorted, privateCow)
+	t.reassignCow(newRoot, t.cow, privateCow)
+	t.root = newRoot
+	t.length = len(sorted)
+}
+
+// reassignCow re-stamps every node of a freshly built subtree from oldCow to
+// newCow after construction, transferring ownership without copying. The walk
+// is iterative so its cost does not depend on recursion depth.
+func (t *BTreeG[T]) reassignCow(root *node[T], newCow, oldCow *copyOnWriteContext[T]) {
+	stack := items[*node[T]]{root}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n == nil || n.cow != oldCow {
+			continue
+		}
+		n.cow = newCow
+		stack = append(stack, n.children...)
+	}
+}
+
+// bulkLoadWith builds a compacted, minimum-height subtree from a sorted
+// slice, allocating every node from the supplied write context so the rebuild
+// is isolated from the tree's (possibly shared) freelist. Every non-root node
+// obeys the same fill invariants as a tree grown through normal inserts, so
+// the existing delete merge/steal logic keeps working.
+//
+// The construction is bottom-up. Leaves are packed to capacity first; then
+// each internal level groups a valid number of sibling subtrees (between
+// minItems+1 and maxItems+1 children, the root excepted) and lifts the
+// boundary key between two adjacent subtrees into the parent. Boundary keys
+// come straight from the sorted slice rather than being pulled out of a
+// constructed node, so no subtree is ever mutated or hollowed out.
+func (t *BTreeG[T]) bulkLoadWith(sorted items[T], cow *copyOnWriteContext[T]) *node[T] {
+	if len(sorted) == 0 {
+		return nil
+	}
+	maxItems := t.maxItems()
+
+	// Build full leaves and remember, for each leaf boundary, the key that
+	// separates it from the preceding leaf. boundaries[i] is the smallest key
+	// of the following leaf and is stored in an ancestor rather than in a leaf.
+	nodes := items[*node[T]]{}
+	boundaries := items[T]{}
+	for start := 0; start < len(sorted); {
+		end := start + maxItems
+		if end > len(sorted) {
+			end = len(sorted)
+		}
+		leaf := cow.newNode()
+		if len(nodes) == 0 {
+			leaf.items = append(leaf.items, sorted[start:end]...)
+		} else {
+			boundaries = append(boundaries, sorted[start])
+			leaf.items = append(leaf.items, sorted[start+1:end]...)
+		}
+		nodes = append(nodes, leaf)
+		start = end
+	}
+
+	// Fold upward until a single root remains.
+	for len(nodes) > 1 {
+		nodes, boundaries = t.groupSiblings(nodes, boundaries, cow)
+	}
+	return nodes[0]
+}
+
+// groupSiblings folds one node level into the next. A final child span below
+// the minimum child count is redistributed into the previous span, so only
+// the eventual root may be sparse.
+func (t *BTreeG[T]) groupSiblings(nodes items[*node[T]], boundaries items[T], cow *copyOnWriteContext[T]) (items[*node[T]], items[T]) {
+	maxChildren := t.maxItems() + 1
+	minChildren := t.minItems() + 1
+
+	type span struct{ lo, hi int }
+	var spans []span
+	start := 0
+	for start < len(nodes) {
+		end := start + maxChildren
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		spans = append(spans, span{start, end})
+		start = end
+	}
+	if len(spans) > 1 {
+		last := &spans[len(spans)-1]
+		prev := &spans[len(spans)-2]
+		for (last.hi-last.lo) < minChildren && (prev.hi-prev.lo) > minChildren {
+			prev.hi--
+			last.lo--
+		}
+		if (last.hi - last.lo) < minChildren {
+			prev.hi = last.hi
+			spans = spans[:len(spans)-1]
+		}
+	}
+
+	outNodes := items[*node[T]]{}
+	outBoundaries := items[T]{}
+	keyPos := 0
+	for si, sp := range spans {
+		childCount := sp.hi - sp.lo
+		parent := cow.newNode()
+		parent.children = append(parent.children, nodes[sp.lo:sp.hi]...)
+		if si > 0 {
+			outBoundaries = append(outBoundaries, boundaries[keyPos])
+			keyPos++
+		}
+		parent.items = append(parent.items, boundaries[keyPos:keyPos+childCount-1]...)
+		keyPos += childCount - 1
+		outNodes = append(outNodes, parent)
+	}
+	return outNodes, outBoundaries
 }
 
 // AscendRange calls the iterator for every value in the tree within the range
@@ -858,13 +1115,14 @@ func (t *BTreeG[T]) Len() int {
 // one, instead of being lost to the garbage collector.
 //
 // This call takes:
-//   O(1): when addNodesToFreelist is false, this is a single operation.
-//   O(1): when the freelist is already full, it breaks out immediately
-//   O(freelist size):  when the freelist is empty and the nodes are all owned
-//       by this tree, nodes are added to the freelist until full.
-//   O(tree size):  when all nodes are owned by another tree, all nodes are
-//       iterated over looking for nodes to add to the freelist, and due to
-//       ownership, none are.
+//
+//	O(1): when addNodesToFreelist is false, this is a single operation.
+//	O(1): when the freelist is already full, it breaks out immediately
+//	O(freelist size):  when the freelist is empty and the nodes are all owned
+//	    by this tree, nodes are added to the freelist until full.
+//	O(tree size):  when all nodes are owned by another tree, all nodes are
+//	    iterated over looking for nodes to add to the freelist, and due to
+//	    ownership, none are.
 func (t *BTreeG[T]) Clear(addNodesToFreelist bool) {
 	if t.root != nil && addNodesToFreelist {
 		t.root.reset(t.cow)
@@ -1071,13 +1329,32 @@ func (t *BTree) Len() int {
 // one, instead of being lost to the garbage collector.
 //
 // This call takes:
-//   O(1): when addNodesToFreelist is false, this is a single operation.
-//   O(1): when the freelist is already full, it breaks out immediately
-//   O(freelist size):  when the freelist is empty and the nodes are all owned
-//       by this tree, nodes are added to the freelist until full.
-//   O(tree size):  when all nodes are owned by another tree, all nodes are
-//       iterated over looking for nodes to add to the freelist, and due to
-//       ownership, none are.
+//
+//	O(1): when addNodesToFreelist is false, this is a single operation.
+//	O(1): when the freelist is already full, it breaks out immediately
+//	O(freelist size):  when the freelist is empty and the nodes are all owned
+//	    by this tree, nodes are added to the freelist until full.
+//	O(tree size):  when all nodes are owned by another tree, all nodes are
+//	    iterated over looking for nodes to add to the freelist, and due to
+//	    ownership, none are.
 func (t *BTree) Clear(addNodesToFreelist bool) {
 	(*BTreeG[Item])(t).Clear(addNodesToFreelist)
+}
+
+// Compact rebuilds the tree from its current items so every node is as full
+// as possible and the tree occupies its minimum height. See BTreeG.Compact
+// for the full semantics, cost and ordering guarantees.
+func (t *BTree) Compact() {
+	(*BTreeG[Item])(t).Compact()
+}
+
+// SetAutoCompact toggles automatic structural compaction after bulk
+// deletions. See BTreeG.SetAutoCompact for details.
+func (t *BTree) SetAutoCompact(enabled bool) {
+	(*BTreeG[Item])(t).SetAutoCompact(enabled)
+}
+
+// AutoCompact reports whether automatic structural compaction is enabled.
+func (t *BTree) AutoCompact() bool {
+	return (*BTreeG[Item])(t).AutoCompact()
 }
