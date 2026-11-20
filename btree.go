@@ -56,6 +56,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Item represents a single object in the tree.
@@ -81,9 +82,29 @@ var (
 // BTree has its own FreeList, but multiple BTrees can share the same
 // FreeList.
 // Two Btrees using the same freelist are safe for concurrent write access.
+//
+// Nodes freed by a writer are not truncated or reused immediately.  A writer
+// always splices a node out of the tree (or replaces it with a copy) before
+// freeing it, so a freed node is only reachable to readers that entered
+// before the free.  Freed nodes are therefore retired into an epoch-based
+// limbo list and reclaimed only once no in-flight reader could still
+// reference them.  Readers announce themselves with pin/unpin, which is
+// lock-free; the reclamation check on the write path is a pair of atomic
+// loads under the free list mutex that already serializes free list access.
 type FreeList struct {
 	mu       sync.Mutex
 	freelist []*node
+	// epoch counts retirement epochs.  Readers pin the epoch they observe
+	// on entry and unpin on exit; a reader is always pinned to the current
+	// epoch or the previous one, because the epoch only advances when no
+	// reader is pinned to an older epoch.  limbo holds one bag of retired
+	// nodes per epoch slot (epoch % 3): a node retired in epoch e lands in
+	// limbo[e%3] and is reclaimed once the epoch has advanced at least two
+	// steps past e, which guarantees every reader that could observe it
+	// has unpinned.
+	epoch   atomic.Int64
+	readers [3]atomic.Int64
+	limbo   [3][]*node
 }
 
 // NewFreeList creates a new free list.
@@ -106,16 +127,77 @@ func (f *FreeList) newNode() (n *node) {
 	return
 }
 
-// freeNode adds the given node to the list, returning true if it was added
-// and false if it was discarded.
+// freeNode adds the given node to the free list, returning true if it was
+// added and false if it was discarded.  The caller must hold f.mu.
 func (f *FreeList) freeNode(n *node) (out bool) {
-	f.mu.Lock()
 	if len(f.freelist) < cap(f.freelist) {
 		f.freelist = append(f.freelist, n)
 		out = true
 	}
-	f.mu.Unlock()
 	return
+}
+
+// pin marks the calling goroutine as actively reading nodes owned by this
+// free list, and returns the pinned epoch to pass to unpin.  It is lock-free.
+// It must be called before loading the tree's root pointer.
+func (f *FreeList) pin() int64 {
+	for {
+		e := f.epoch.Load()
+		f.readers[e%3].Add(1)
+		if f.epoch.Load() == e {
+			return e
+		}
+		// The epoch advanced while pinning; the count just added may protect
+		// a slot that is about to be reclaimed, so back out and retry.
+		f.readers[e%3].Add(-1)
+	}
+}
+
+// unpin releases a read pin previously acquired with pin.
+func (f *FreeList) unpin(e int64) {
+	f.readers[e%3].Add(-1)
+}
+
+// retire defers reclamation of n until no in-flight reader can observe it.
+// The node is left untouched (its items and children stay valid for readers)
+// and is truncated and returned to the free list only after every reader
+// that could reference it has unpinned.  The reclamation check itself is a
+// pair of atomic loads on the reader counts; no locks are added to the write
+// path beyond the free list mutex that already serializes free list access.
+func (f *FreeList) retire(n *node) freeType {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := f.epoch.Load()
+	// Nodes retired two epochs ago were already unreachable when every
+	// currently pinned reader entered, so they are always safe to reclaim.
+	f.reclaimSlot((e + 1) % 3)
+	// The previous epoch's bag becomes safe once no reader is still pinned
+	// to a past epoch; advance the epoch so future retires rotate bags.
+	if f.readers[(e+1)%3].Load() == 0 && f.readers[(e+2)%3].Load() == 0 {
+		f.reclaimSlot((e + 2) % 3)
+		e++
+		f.epoch.Store(e)
+	}
+	if len(f.freelist) == cap(f.freelist) {
+		// No room to recycle n; leave it untouched for the GC so that
+		// in-flight readers can keep walking it.
+		return ftFreelistFull
+	}
+	f.limbo[e%3] = append(f.limbo[e%3], n)
+	return ftStored
+}
+
+// reclaimSlot truncates and recycles the nodes retired in the given epoch
+// slot.  The caller must hold f.mu and must have established that no pinned
+// reader can still observe the slot's nodes.
+func (f *FreeList) reclaimSlot(slot int64) {
+	for _, m := range f.limbo[slot] {
+		// clear to allow GC, then recycle or discard
+		m.items.truncate(0)
+		m.children.truncate(0)
+		f.freeNode(m)
+	}
+	f.limbo[slot] = nil
 }
 
 // ItemIterator allows callers of Ascend* to iterate in-order over portions of
@@ -662,17 +744,13 @@ const (
 // freeNode frees a node within a given COW context, if it's owned by that
 // context.  It returns what happened to the node (see freeType const
 // documentation).
+//
+// The node is retired through the free list's epoch-based reclamation: it is
+// not truncated or recycled until no in-flight reader can still reference it.
 func (c *copyOnWriteContext) freeNode(n *node) freeType {
 	if n.cow == c {
-		// clear to allow GC
-		n.items.truncate(0)
-		n.children.truncate(0)
 		n.cow = nil
-		if c.freelist.freeNode(n) {
-			return ftStored
-		} else {
-			return ftFreelistFull
-		}
+		return c.freelist.retire(n)
 	} else {
 		return ftNotOwned
 	}
@@ -747,6 +825,9 @@ func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 // AscendRange calls the iterator for every value in the tree within the range
 // [greaterOrEqual, lessThan), until iterator returns false.
 func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -756,6 +837,9 @@ func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator
 // AscendLessThan calls the iterator for every value in the tree within the range
 // [first, pivot), until iterator returns false.
 func (t *BTree) AscendLessThan(pivot Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -765,6 +849,9 @@ func (t *BTree) AscendLessThan(pivot Item, iterator ItemIterator) {
 // AscendGreaterOrEqual calls the iterator for every value in the tree within
 // the range [pivot, last], until iterator returns false.
 func (t *BTree) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -774,6 +861,9 @@ func (t *BTree) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
 // Ascend calls the iterator for every value in the tree within the range
 // [first, last], until iterator returns false.
 func (t *BTree) Ascend(iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -783,6 +873,9 @@ func (t *BTree) Ascend(iterator ItemIterator) {
 // DescendRange calls the iterator for every value in the tree within the range
 // [lessOrEqual, greaterThan), until iterator returns false.
 func (t *BTree) DescendRange(lessOrEqual, greaterThan Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -792,6 +885,9 @@ func (t *BTree) DescendRange(lessOrEqual, greaterThan Item, iterator ItemIterato
 // DescendLessOrEqual calls the iterator for every value in the tree within the range
 // [pivot, first], until iterator returns false.
 func (t *BTree) DescendLessOrEqual(pivot Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -801,6 +897,9 @@ func (t *BTree) DescendLessOrEqual(pivot Item, iterator ItemIterator) {
 // DescendGreaterThan calls the iterator for every value in the tree within
 // the range [last, pivot), until iterator returns false.
 func (t *BTree) DescendGreaterThan(pivot Item, iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -810,6 +909,9 @@ func (t *BTree) DescendGreaterThan(pivot Item, iterator ItemIterator) {
 // Descend calls the iterator for every value in the tree within the range
 // [last, first], until iterator returns false.
 func (t *BTree) Descend(iterator ItemIterator) {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return
 	}
@@ -819,6 +921,9 @@ func (t *BTree) Descend(iterator ItemIterator) {
 // Get looks for the key item in the tree, returning it.  It returns nil if
 // unable to find that item.
 func (t *BTree) Get(key Item) Item {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	if t.root == nil {
 		return nil
 	}
@@ -827,11 +932,17 @@ func (t *BTree) Get(key Item) Item {
 
 // Min returns the smallest item in the tree, or nil if the tree is empty.
 func (t *BTree) Min() Item {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	return min(t.root)
 }
 
 // Max returns the largest item in the tree, or nil if the tree is empty.
 func (t *BTree) Max() Item {
+	fl := t.cow.freelist
+	e := fl.pin()
+	defer fl.unpin(e)
 	return max(t.root)
 }
 
