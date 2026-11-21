@@ -726,6 +726,66 @@ func (t *BTreeG[T]) DeleteMax() (T, bool) {
 	return t.deleteItem(zero, removeMax)
 }
 
+// DeleteRange removes all items in the given key range and returns the number
+// of items removed.
+//
+// With no endpoint arguments, the range is [min, max): min is included and max
+// is excluded. With one endpoint argument, it controls whether max is included;
+// min remains included. With two endpoint arguments, they control whether min
+// and max are included, respectively. Use Open/Closed (or their aliases
+// Exclusive/Inclusive) to make the intent explicit.
+//
+// DeleteRange locates the range with a single traversal and then removes the
+// selected items through the normal deletion path. It does not perform an extra
+// lookup per deleted item, and Delete's behavior and cost are unchanged.
+func (t *BTreeG[T]) DeleteRange(min, max T, endpointInclusion ...EndpointInclusion) int {
+	minInclusive, maxInclusive := true, false
+	switch len(endpointInclusion) {
+	case 0:
+	case 1:
+		maxInclusive = endpointInclusion[0]
+	case 2:
+		minInclusive, maxInclusive = endpointInclusion[0], endpointInclusion[1]
+	default:
+		panic("DeleteRange: too many endpoint arguments")
+	}
+	return t.deleteRange(min, max, minInclusive, maxInclusive)
+}
+
+func (t *BTreeG[T]) deleteRange(min, max T, minInclusive, maxInclusive bool) int {
+	if t.root == nil || len(t.root.items) == 0 {
+		return 0
+	}
+	less := t.cow.less
+	if less(max, min) {
+		return 0
+	}
+	if !less(min, max) && !(minInclusive && maxInclusive) {
+		return 0
+	}
+
+	var doomed []T
+	t.AscendGreaterOrEqual(min, func(item T) bool {
+		if !minInclusive && !less(min, item) {
+			return true
+		}
+		if maxInclusive {
+			if less(max, item) {
+				return false
+			}
+		} else if !less(item, max) {
+			return false
+		}
+		doomed = append(doomed, item)
+		return true
+	})
+
+	for _, item := range doomed {
+		t.Delete(item)
+	}
+	return len(doomed)
+}
+
 func (t *BTreeG[T]) deleteItem(item T, typ toRemove) (_ T, _ bool) {
 	if t.root == nil || len(t.root.items) == 0 {
 		return
@@ -969,6 +1029,18 @@ func (t *BTree) DeleteMax() Item {
 func (t *BTree) DeleteMin() Item {
 	i, _ := (*BTreeG[Item])(t).DeleteMin()
 	return i
+}
+
+// DeleteRange removes all items in the given key range and returns the number
+// of items removed.
+//
+// With no endpoint arguments, the range is [min, max): min is included and max
+// is excluded. With one endpoint argument, it controls whether max is included;
+// min remains included. With two endpoint arguments, they control whether min
+// and max are included, respectively. Use Open/Closed (or their aliases
+// Exclusive/Inclusive) to make the intent explicit.
+func (t *BTree) DeleteRange(min, max Item, endpointInclusion ...EndpointInclusion) int {
+	return (*BTreeG[Item])(t).DeleteRange(min, max, endpointInclusion...)
 }
 
 // Get looks for the key item in the tree, returning it.  It returns nil if

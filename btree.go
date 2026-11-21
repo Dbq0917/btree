@@ -727,6 +727,76 @@ func (t *BTree) DeleteMax() Item {
 	return t.deleteItem(nil, removeMax)
 }
 
+// DeleteRange removes all items in the given key range and returns the number
+// of items removed.
+//
+// With no endpoint arguments, the range is [min, max): min is included and max
+// is excluded. With one endpoint argument, it controls whether max is included;
+// min remains included. With two endpoint arguments, they control whether min
+// and max are included, respectively. Use Open/Closed (or their aliases
+// Exclusive/Inclusive) to make the intent explicit.
+//
+// A nil bound means the range is unbounded on that side.
+//
+// DeleteRange locates the range with a single traversal and then removes the
+// selected items through the normal deletion path. It does not perform an extra
+// lookup per deleted item, and Delete's behavior and cost are unchanged.
+func (t *BTree) DeleteRange(min, max Item, endpointInclusion ...EndpointInclusion) int {
+	minInclusive, maxInclusive := true, false
+	switch len(endpointInclusion) {
+	case 0:
+	case 1:
+		maxInclusive = endpointInclusion[0]
+	case 2:
+		minInclusive, maxInclusive = endpointInclusion[0], endpointInclusion[1]
+	default:
+		panic("DeleteRange: too many endpoint arguments")
+	}
+	return t.deleteRange(min, max, minInclusive, maxInclusive)
+}
+
+func (t *BTree) deleteRange(min, max Item, minInclusive, maxInclusive bool) int {
+	if t.root == nil || len(t.root.items) == 0 {
+		return 0
+	}
+	if min != nil && max != nil {
+		if max.Less(min) {
+			return 0
+		}
+		if !min.Less(max) && !(minInclusive && maxInclusive) {
+			return 0
+		}
+	}
+
+	var doomed []Item
+	iter := func(item Item) bool {
+		if min != nil && !minInclusive && !min.Less(item) {
+			return true
+		}
+		if max != nil {
+			if maxInclusive {
+				if max.Less(item) {
+					return false
+				}
+			} else if !item.Less(max) {
+				return false
+			}
+		}
+		doomed = append(doomed, item)
+		return true
+	}
+	if min == nil {
+		t.Ascend(ItemIterator(iter))
+	} else {
+		t.AscendGreaterOrEqual(min, ItemIterator(iter))
+	}
+
+	for _, item := range doomed {
+		t.Delete(item)
+	}
+	return len(doomed)
+}
+
 func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 	if t.root == nil || len(t.root.items) == 0 {
 		return nil

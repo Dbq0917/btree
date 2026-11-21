@@ -193,6 +193,82 @@ func TestDeleteMax(t *testing.T) {
 	}
 }
 
+func TestDeleteRangeBoundaries(t *testing.T) {
+	tests := []struct {
+		name       string
+		endpoints  []EndpointInclusion
+		minInclude bool
+		maxInclude bool
+	}{
+		{name: "default half-open", minInclude: true},
+		{name: "one argument open", endpoints: []EndpointInclusion{Open}, minInclude: true},
+		{name: "one argument closed", endpoints: []EndpointInclusion{Closed}, minInclude: true, maxInclude: true},
+		{name: "open open", endpoints: []EndpointInclusion{Open, Open}},
+		{name: "closed open", endpoints: []EndpointInclusion{Closed, Open}, minInclude: true},
+		{name: "open closed", endpoints: []EndpointInclusion{Open, Closed}, maxInclude: true},
+		{name: "closed closed", endpoints: []EndpointInclusion{Closed, Closed}, minInclude: true, maxInclude: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := New(2)
+			for _, v := range perm(100) {
+				tr.ReplaceOrInsert(v)
+			}
+
+			got := tr.DeleteRange(Int(30), Int(40), tt.endpoints...)
+			want := 10
+			if !tt.minInclude {
+				want--
+			}
+			if tt.maxInclude {
+				want++
+			}
+			if got != want {
+				t.Fatalf("DeleteRange removed %d items, want %d", got, want)
+			}
+			if tr.Len() != 100-want {
+				t.Fatalf("Len after DeleteRange = %d, want %d", tr.Len(), 100-want)
+			}
+
+			var wantItems []Item
+			for i := 0; i < 100; i++ {
+				switch {
+				case i == 30:
+					if !tt.minInclude {
+						wantItems = append(wantItems, Int(i))
+					}
+				case i == 40:
+					if !tt.maxInclude {
+						wantItems = append(wantItems, Int(i))
+					}
+				case i > 30 && i < 40:
+					// Removed by every endpoint combination below.
+				default:
+					wantItems = append(wantItems, Int(i))
+				}
+			}
+			if gotItems := all(tr); !reflect.DeepEqual(gotItems, wantItems) {
+				t.Fatalf("items after DeleteRange:\n got: %v\nwant: %v", gotItems, wantItems)
+			}
+		})
+	}
+
+	tr := New(2)
+	for _, v := range perm(100) {
+		tr.ReplaceOrInsert(v)
+	}
+	if got := tr.DeleteRange(Int(50), Int(50), Open, Open); got != 0 || tr.Len() != 100 {
+		t.Fatalf("empty open range removed %d items, Len = %d", got, tr.Len())
+	}
+	if got := tr.DeleteRange(Int(50), Int(50), Closed, Closed); got != 1 || tr.Len() != 99 {
+		t.Fatalf("closed singleton range removed %d items, Len = %d", got, tr.Len())
+	}
+	if got := tr.DeleteRange(Int(60), Int(40)); got != 0 || tr.Len() != 99 {
+		t.Fatalf("reversed range removed %d items, Len = %d", got, tr.Len())
+	}
+}
+
 func TestAscendRange(t *testing.T) {
 	tr := New(2)
 	for _, v := range perm(100) {
