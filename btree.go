@@ -247,7 +247,24 @@ func (s *children) truncate(index int) {
 type node struct {
 	items    items
 	children children
-	cow      *copyOnWriteContext
+	// height is the height of the subtree rooted at this node: 1 for a leaf,
+	// otherwise one more than the height of its tallest child. It is a property
+	// of the node itself and is maintained locally at every structural change
+	// (split/merge/steal), so lookups never need to recompute it.
+	height int
+	cow    *copyOnWriteContext
+}
+
+// recomputeHeight refreshes the cached height from the node's own children.
+// It is O(1): a node's children all share the same height in a B-tree, so only
+// the first child needs to be inspected. It must be called whenever a node's
+// set of children changes (split, merge, steal, root replacement).
+func (n *node) recomputeHeight() {
+	if len(n.children) == 0 {
+		n.height = 1
+		return
+	}
+	n.height = n.children[0].height + 1
 }
 
 func (n *node) mutableFor(cow *copyOnWriteContext) *node {
@@ -268,6 +285,7 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 		out.children = make(children, len(n.children), cap(n.children))
 	}
 	copy(out.children, n.children)
+	out.height = n.height
 	return out
 }
 
@@ -289,6 +307,10 @@ func (n *node) split(i int) (Item, *node) {
 		next.children = append(next.children, n.children[i+1:]...)
 		n.children.truncate(i + 1)
 	}
+	// Both halves keep the same subtree shape, so they inherit this node's
+	// height. The height travels with the nodes rather than being recomputed
+	// by their parents.
+	next.height = n.height
 	return item, next
 }
 
@@ -336,6 +358,12 @@ func (n *node) insert(item Item, maxItems int) Item {
 }
 
 // get finds the given key in the subtree and returns it.
+//
+// Descent is driven solely by the node's own contents and stops at an actual
+// leaf (a node with no children). It never consults a cached height, so a
+// stale height left behind by a merge or split cannot make the search declare
+// a key missing before reaching the leaf. The cached height is therefore off
+// the read path and costs nothing during normal lookups.
 func (n *node) get(key Item) Item {
 	i, found := n.items.find(key)
 	if found {
@@ -462,6 +490,7 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		if len(stealFrom.children) > 0 {
 			child.children.insertAt(0, stealFrom.children.pop())
 		}
+		child.recomputeHeight()
 	} else if i < len(n.items) && len(n.children[i+1].items) > minItems {
 		// steal from right child
 		child := n.mutableChild(i)
@@ -472,6 +501,7 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		if len(stealFrom.children) > 0 {
 			child.children = append(child.children, stealFrom.children.removeAt(0))
 		}
+		child.recomputeHeight()
 	} else {
 		if i >= len(n.items) {
 			i--
@@ -483,6 +513,10 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		child.items = append(child.items, mergeItem)
 		child.items = append(child.items, mergeChild.items...)
 		child.children = append(child.children, mergeChild.children...)
+		// The merged node absorbs a sibling of the same height, so its own
+		// height is unchanged; refresh it anyway to keep the cached value
+		// trustworthy regardless of where the nodes came from (freelist reuse).
+		child.recomputeHeight()
 		n.cow.freeNode(mergeChild)
 	}
 	return n.remove(item, minItems, typ)
@@ -648,6 +682,10 @@ func (t *BTree) minItems() int {
 func (c *copyOnWriteContext) newNode() (n *node) {
 	n = c.freelist.newNode()
 	n.cow = c
+	// A node recycled from the freelist may carry a stale height from its
+	// previous life; start every (re)used node as a leaf until it gains
+	// children, at which point recomputeHeight sets the real value.
+	n.height = 1
 	return
 }
 
@@ -690,6 +728,7 @@ func (t *BTree) ReplaceOrInsert(item Item) Item {
 	if t.root == nil {
 		t.root = t.cow.newNode()
 		t.root.items = append(t.root.items, item)
+		t.root.height = 1
 		t.length++
 		return nil
 	} else {
@@ -700,6 +739,7 @@ func (t *BTree) ReplaceOrInsert(item Item) Item {
 			t.root = t.cow.newNode()
 			t.root.items = append(t.root.items, item2)
 			t.root.children = append(t.root.children, oldroot, second)
+			t.root.recomputeHeight()
 		}
 	}
 	out := t.root.insert(item, t.maxItems())
@@ -736,6 +776,8 @@ func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 	if len(t.root.items) == 0 && len(t.root.children) > 0 {
 		oldroot := t.root
 		t.root = t.root.children[0]
+		// The new root is the old root's only child; its cached height is
+		// already correct and simply becomes the tree's height.
 		t.cow.freeNode(oldroot)
 	}
 	if out != nil {

@@ -762,3 +762,78 @@ func BenchmarkDeleteAndRestoreG(b *testing.B) {
 		}
 	})
 }
+
+// checkHeightG walks the tree and verifies that every node's cached height
+// matches its actual shape: 1 for a leaf, otherwise one more than its
+// children's height. It returns the subtree height at n.
+func checkHeightG[T any](n *node[T]) int {
+	if n == nil {
+		return 0
+	}
+	if len(n.children) == 0 {
+		if n.height != 1 {
+			panic(fmt.Sprintf("leaf height = %d, want 1", n.height))
+		}
+		return 1
+	}
+	want := 0
+	for _, c := range n.children {
+		if h := checkHeightG(c); want == 0 {
+			want = h + 1
+		} else if h+1 != want {
+			panic("children of a node have unequal heights")
+		}
+	}
+	if n.height != want {
+		panic(fmt.Sprintf("cached height = %d, want %d", n.height, want))
+	}
+	return want
+}
+
+// TestAlternatingInsertDeleteG interleaves inserts and deletes for a thousand
+// rounds and then looks up every key, reproducing the failure mode where a
+// stale cached height made a lookup stop before reaching the real leaf. It
+// also checks the cached-height invariant after every round.
+func TestAlternatingInsertDeleteG(t *testing.T) {
+	for _, degree := range []int{2, 3, *btreeDegree} {
+		tr := NewOrderedG[int](degree)
+		present := make(map[int]bool)
+		const rounds = 1000
+		for round := 0; round < rounds; round++ {
+			key := rand.Intn(rounds)
+			if present[key] || (!present[key] && rand.Intn(2) == 0) {
+				if _, existed := tr.ReplaceOrInsert(key); existed != present[key] {
+					t.Fatalf("degree %d round %d: insert(%d) existed=%v, want %v",
+						degree, round, key, existed, present[key])
+				}
+				present[key] = true
+				// The just-inserted key must be reachable immediately; a stale
+				// height used to make this report a miss.
+				if !tr.Has(key) {
+					t.Fatalf("degree %d round %d: just-inserted key %d not found",
+						degree, round, key)
+				}
+			} else {
+				if _, existed := tr.Delete(key); existed != present[key] {
+					t.Fatalf("degree %d round %d: delete(%d) existed=%v, want %v",
+						degree, round, key, existed, present[key])
+				}
+				delete(present, key)
+			}
+			checkHeightG(tr.root)
+			if tr.Len() != len(present) {
+				t.Fatalf("degree %d round %d: Len=%d, want %d",
+					degree, round, tr.Len(), len(present))
+			}
+		}
+		// Full sweep: every key still tracked must be found, and no absent key
+		// may resolve.
+		for key := 0; key < rounds; key++ {
+			if tr.Has(key) != present[key] {
+				t.Fatalf("degree %d: key %d presence=%v, want %v",
+					degree, key, tr.Has(key), present[key])
+			}
+		}
+		checkHeightG(tr.root)
+	}
+}
