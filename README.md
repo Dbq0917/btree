@@ -72,6 +72,7 @@ SeekPrev(key)           # Searches for the first item that is < key.
 All()                   # Iterate items in ascending order.            (iter.Seq2[K,V])
 Backward()              # Iterate items in descending order.           (iter.Seq2[K,V])
 Ascend(key)             # Iterate items in ascending order >= to key.  (iter.Seq2[K,V])
+AscendRange(min, max)   # Iterate items in ascending order within [min, max). (iter.Seq2[K,V])
 Descend(key)            # Iterate items in descending order <= to key. (iter.Seq2[K,V])
 Keys()                  # Iterate key only in ascending order.         (iter.Seq[K])
 Values()                # Iterate values only in ascending order.      (iter.Seq[K])
@@ -181,6 +182,7 @@ Len()                   # Get the number of keys in the collection
 All()                   # Iterate keys in ascending order.            (iter.Seq[K])
 Backward()              # Iterate keys in descending order.           (iter.Seq[K])
 Ascend(key)             # Iterate keys in ascending order >= to key.  (iter.Seq[K])
+AscendRange(min, max)   # Iterate keys in ascending order within [min, max). (iter.Seq[K])
 Descend(key)            # Iterate keys in descending order <= to key. (iter.Seq[K])
 
 Seek(key)               # Searches for the first key that is >= to key
@@ -583,6 +585,7 @@ SeekPrev(key)           # Searches for the first item that is < key.
 All()                   # Iterate items in ascending order.            (iter.Seq[T])
 Backward()              # Iterate items in descending order.           (iter.Seq[T])
 Ascend(key)             # Iterate items in ascending order >= to key.  (iter.Seq[T])
+AscendRange(min, max)   # Iterate items in ascending order within [min, max). (iter.Seq[T])
 Descend(key)            # Iterate items in descending order <= to key. (iter.Seq[T])
 
 PushFront(item)         # Insert item to front of table.

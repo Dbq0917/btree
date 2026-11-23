@@ -820,6 +820,37 @@ func (t *tree[K, V]) AscendMut(key K, value V) iter.Seq2[K, V] {
 	}
 }
 
+func (t *tree[K, V]) ascendRange0(minKey K, minValue V, maxKey K, maxValue V,
+	yield func(K, V) bool, mut bool,
+) {
+	t.ascend0(minKey, minValue, func(key K, value V) bool {
+		if t.gte(key, value, maxKey, maxValue) {
+			return false
+		}
+		return yield(key, value)
+	}, mut)
+}
+
+// AscendRange returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+func (t *tree[K, V]) AscendRange(minKey K, minValue V, maxKey K, maxValue V,
+) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		t.ascendRange0(minKey, minValue, maxKey, maxValue, yield, false)
+	}
+}
+
+// AscendRangeMut returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+// MUTABLE OPERATION
+func (t *tree[K, V]) AscendRangeMut(minKey K, minValue V, maxKey K,
+	maxValue V,
+) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		t.ascendRange0(minKey, minValue, maxKey, maxValue, yield, true)
+	}
+}
+
 func (t *tree[K, V]) nodeInsert(n *node[K, V], key K, value V) (V, int) {
 	var emptyValue V
 	i, found := t.search(n, key, value)

@@ -304,6 +304,21 @@ func (b *Map[K, V]) AscendMut(key K) iter.Seq2[K, V] {
 	return b.tree.AscendMut(key, emptyValue)
 }
 
+// AscendRange returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+func (b *Map[K, V]) AscendRange(min, max K) iter.Seq2[K, V] {
+	var emptyValue V
+	return b.tree.AscendRange(min, emptyValue, max, emptyValue)
+}
+
+// AscendRangeMut returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+// MUTABLE OPERATION
+func (b *Map[K, V]) AscendRangeMut(min, max K) iter.Seq2[K, V] {
+	var emptyValue V
+	return b.tree.AscendRangeMut(min, emptyValue, max, emptyValue)
+}
+
 // Len returns the number of items in map
 func (b *Map[K, V]) Len() int {
 	return b.tree.Len()

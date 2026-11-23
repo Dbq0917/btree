@@ -560,6 +560,148 @@ func shuffle[T any](rng *rand.Rand, slice []T) {
 	}
 }
 
+func TestMapAscendRange(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(0, seed))
+
+	var m Map[int, int]
+	N := 10000
+	for _, key := range rng.Perm(N) {
+		old, inserted := m.Insert(key, -key)
+		assert(inserted && old == 0)
+	}
+	collect := func(min, max int) []int {
+		var keys []int
+		for key := range m.AscendRange(min, max) {
+			keys = append(keys, key)
+		}
+		return keys
+	}
+	// min is inclusive, max is exclusive
+	assert(slices.Equal(collect(3, 7), []int{3, 4, 5, 6}))
+	// empty ranges
+	assert(len(collect(0, 0)) == 0)
+	assert(len(collect(500, 500)) == 0)
+	assert(len(collect(700, 300)) == 0)
+	assert(len(collect(N, N+1)) == 0)
+	assert(len(collect(-10, -5)) == 0)
+	// full range matches All()
+	var all []int
+	for key := range m.All() {
+		all = append(all, key)
+	}
+	assert(slices.Equal(collect(0, N), all))
+	assert(slices.Equal(collect(-1, N+1), all))
+	// random ranges match a filtered full scan
+	for range 200 {
+		min := rng.IntN(N+20) - 10
+		max := rng.IntN(N+20) - 10
+		var expect []int
+		for _, key := range all {
+			if key >= min && key < max {
+				expect = append(expect, key)
+			}
+		}
+		assert(slices.Equal(collect(min, max), expect))
+	}
+}
+
+func TestSetAscendRange(t *testing.T) {
+	var s Set[int]
+	for i := 0; i < 1000; i++ {
+		s.Insert(i)
+	}
+	var keys []int
+	for key := range s.AscendRange(100, 110) {
+		keys = append(keys, key)
+	}
+	assert(len(keys) == 10 && keys[0] == 100 && keys[9] == 109)
+}
+
+func TestTableAscendRange(t *testing.T) {
+	b := NewTableOptions(TableOptions[int]{
+		Compare: func(a, b int) int { return cmp.Compare(a, b) },
+	})
+	for i := 0; i < 1000; i++ {
+		b.Insert(i)
+	}
+	var items []int
+	for item := range b.AscendRange(100, 110) {
+		items = append(items, item)
+	}
+	assert(len(items) == 10 && items[0] == 100 && items[9] == 109)
+}
+
+// TestMapPagination simulates paging over a time range with a page size of
+// 20, up to page 100. It compares the classic head-scan approach (scan from
+// the beginning and skip) with the cursor approach (AscendRange continuing
+// from the last key of the previous page) and logs the timings.
+func TestMapPagination(t *testing.T) {
+	var m Map[int64, int]
+	N := 500000
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	for i := 0; i < N; i++ {
+		m.Insert(base+int64(i), i)
+	}
+	rangeEnd := base + int64(N)
+	const pageSize = 20
+	const pages = 100
+
+	// Head-scan: every page rescans from the beginning using the existing
+	// full scan.
+	pageFromHead := func(page int) ([]int64, time.Duration) {
+		start := time.Now()
+		offset := (page - 1) * pageSize
+		var keys []int64
+		i := 0
+		for key := range m.All() {
+			if i >= offset {
+				keys = append(keys, key)
+				if len(keys) == pageSize {
+					break
+				}
+			}
+			i++
+		}
+		return keys, time.Since(start)
+	}
+
+	// Cursor: every page starts at the last key of the previous page.
+	pageFromCursor := func(cursor int64, first bool) ([]int64, time.Duration) {
+		start := time.Now()
+		var keys []int64
+		for key := range m.AscendRange(cursor, rangeEnd) {
+			if !first && key == cursor {
+				continue // skip the last key of the previous page
+			}
+			keys = append(keys, key)
+			if len(keys) == pageSize {
+				break
+			}
+		}
+		return keys, time.Since(start)
+	}
+
+	var headTotal, cursorTotal time.Duration
+	var headLast, cursorLast time.Duration
+	cursor := base
+	for page := 1; page <= pages; page++ {
+		headKeys, headDur := pageFromHead(page)
+		cursorKeys, cursorDur := pageFromCursor(cursor, page == 1)
+		assert(len(headKeys) == pageSize)
+		assert(slices.Equal(headKeys, cursorKeys))
+		cursor = cursorKeys[len(cursorKeys)-1]
+		headTotal += headDur
+		cursorTotal += cursorDur
+		headLast, cursorLast = headDur, cursorDur
+	}
+	t.Logf("head-scan: page %d took %v, %d pages total %v",
+		pages, headLast, pages, headTotal)
+	t.Logf("cursor:    page %d took %v, %d pages total %v",
+		pages, cursorLast, pages, cursorTotal)
+}
+
 func testMapDeleteRange(rng *rand.Rand, N int) time.Duration {
 
 	var arr []int

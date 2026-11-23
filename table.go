@@ -200,6 +200,19 @@ func (b *Table[T]) AscendMut(pivot T) iter.Seq[T] {
 	return iterV(b.tree.AscendMut(omit{}, pivot))
 }
 
+// AscendRange returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+func (b *Table[T]) AscendRange(min, max T) iter.Seq[T] {
+	return iterV(b.tree.AscendRange(omit{}, min, omit{}, max))
+}
+
+// AscendRangeMut returns an iterator for items within the provided min
+// (inclusive) and max (exclusive) sub-range.
+// MUTABLE OPERATION
+func (b *Table[T]) AscendRangeMut(min, max T) iter.Seq[T] {
+	return iterV(b.tree.AscendRangeMut(omit{}, min, omit{}, max))
+}
+
 func (b *Table[T]) Descend(pivot T) iter.Seq[T] {
 	return iterV(b.tree.Descend(omit{}, pivot))
 }

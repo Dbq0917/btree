@@ -84,6 +84,12 @@ func (b *Set[K]) Ascend(key K) iter.Seq[K] {
 	return iterK(b.base.Ascend(key))
 }
 
+// AscendRange returns an iterator for keys within the provided min
+// (inclusive) and max (exclusive) sub-range.
+func (b *Set[K]) AscendRange(min, max K) iter.Seq[K] {
+	return iterK(b.base.AscendRange(min, max))
+}
+
 // Descend returns an iterator starting at index in reverse order.
 func (b *Set[K]) Descend(key K) iter.Seq[K] {
 	return iterK(b.base.Descend(key))
