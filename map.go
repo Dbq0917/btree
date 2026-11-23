@@ -291,7 +291,8 @@ func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 	}
 }
 
-// Ascend returns an iterator starting at key
+// Ascend returns an iterator starting at key.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) Ascend(key K) iter.Seq2[K, V] {
 	var emptyValue V
 	return b.tree.Ascend(key, emptyValue)
@@ -327,7 +328,8 @@ func (b *Map[K, V]) cloneInto(b2 *Map[K, V]) {
 }
 
 // Clone the map.
-// This is a fast O(1) operation using a copy-on-write method.
+// This is a fast O(1) operation using a copy-on-write method. A clone can be
+// reused as a stable view across multiple scans, such as paginated reads.
 func (b *Map[K, V]) Clone() *Map[K, V] {
 	b2 := new(Map[K, V])
 	b.cloneInto(b2)
@@ -364,7 +366,8 @@ func (b *Map[K, V]) Drain(min, max K) Extract2[K, V] {
 	return b.DrainOptions(min, max, DrainOptions{})
 }
 
-// Decend returns an iterator with items less than key, in reverse order.
+// Descend returns an iterator with items less than key, in reverse order.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) Descend(key K) iter.Seq2[K, V] {
 	var emptyValue V
 	return b.tree.Descend(key, emptyValue)
@@ -384,6 +387,7 @@ func (b *Map[K, V]) IndexOf(key K) (int, bool) {
 }
 
 // All returns an iterator of all items in map.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) All() iter.Seq2[K, V] {
 	return b.tree.All()
 }
@@ -395,6 +399,7 @@ func (b *Map[K, V]) AllMut() iter.Seq2[K, V] {
 }
 
 // Backward returns an iterator of all items in map, in reverse order.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) Backward() iter.Seq2[K, V] {
 	return b.tree.Backward()
 }
@@ -405,7 +410,8 @@ func (b *Map[K, V]) BackwardMut() iter.Seq2[K, V] {
 	return b.tree.BackwardMut()
 }
 
-// AscendAt returns an iterator starting at index
+// AscendAt returns an iterator starting at index.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) AscendAt(index int) iter.Seq2[K, V] {
 	return b.tree.AscendAt(index)
 }
@@ -416,7 +422,8 @@ func (b *Map[K, V]) AscendAtMut(index int) iter.Seq2[K, V] {
 	return b.tree.AscendAtMut(index)
 }
 
-// DescendAt returns an iterator starting at index, in reverse order
+// DescendAt returns an iterator starting at index, in reverse order.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) DescendAt(index int) iter.Seq2[K, V] {
 	return b.tree.DescendAt(index)
 }
@@ -520,11 +527,13 @@ func (b *Map[K, V]) GetAtMut(index int) (K, V) {
 }
 
 // Keys returns an iterator of all keys.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) Keys() iter.Seq[K] {
 	return iterK(b.tree.All())
 }
 
 // Values returns an iterator of all values.
+// The iterator scans a fixed copy-on-write snapshot taken when iteration starts.
 func (b *Map[K, V]) Values() iter.Seq[V] {
 	return iterV(b.tree.All())
 }

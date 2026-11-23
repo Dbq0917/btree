@@ -480,9 +480,23 @@ func (t *tree[K, V]) backward0(yield func(K, V) bool, mut bool) {
 	}
 }
 
+// snapshot runs fn against a fixed view of the tree. Cloning is O(1); nodes
+// are copied lazily only when the source tree is mutated during the snapshot.
+func (t *tree[K, V]) snapshot(fn func(*tree[K, V])) {
+	if t.count == 0 {
+		return
+	}
+	var view tree[K, V]
+	t.CloneInto(&view)
+	defer view.Release()
+	fn(&view)
+}
+
 func (t *tree[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.all0(yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.all0(yield, false)
+		})
 	}
 }
 
@@ -494,7 +508,9 @@ func (t *tree[K, V]) AllMut() iter.Seq2[K, V] {
 
 func (t *tree[K, V]) Backward() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.backward0(yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.backward0(yield, false)
+		})
 	}
 }
 
@@ -810,7 +826,9 @@ func (t *tree[K, V]) ascend0(key K, value V, yield func(K, V) bool,
 
 func (t *tree[K, V]) Ascend(key K, value V) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.ascend0(key, value, yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.ascend0(key, value, yield, false)
+		})
 	}
 }
 
@@ -1051,7 +1069,9 @@ func (t *tree[K, V]) descend0(key K, value V, yield func(K, V) bool, mut bool) {
 
 func (t *tree[K, V]) Descend(key K, value V) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.descend0(key, value, yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.descend0(key, value, yield, false)
+		})
 	}
 }
 
@@ -1486,7 +1506,9 @@ func (t *tree[K, V]) descendAt0(index int, yield func(K, V) bool, mut bool) {
 
 func (t *tree[K, V]) AscendAt(index int) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.ascendAt0(index, yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.ascendAt0(index, yield, false)
+		})
 	}
 }
 
@@ -1498,7 +1520,9 @@ func (t *tree[K, V]) AscendAtMut(index int) iter.Seq2[K, V] {
 
 func (t *tree[K, V]) DescendAt(index int) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		t.descendAt0(index, yield, false)
+		t.snapshot(func(view *tree[K, V]) {
+			view.descendAt0(index, yield, false)
+		})
 	}
 }
 
