@@ -201,6 +201,9 @@ func (t *tree[K, V]) insertFirstItem(key K, value V) {
 }
 
 func (t *tree[K, V]) releaseNode(n *node[K, V]) {
+	if n == nil {
+		return
+	}
 	if n.rc.Add(-1) < 0 {
 		// Release items and children
 		if t.dataRelease != nil {
@@ -347,6 +350,27 @@ func (t *tree[K, V]) rebalance(n *node[K, V], i int) {
 		n.branch.counts[n.len] = 0
 
 		n.len--
+		// The merge moves right's items and child pointers into left, which
+		// inherits the parent reference to each subtree. right loses its
+		// parent slot and must be released, but it must not walk into the
+		// subtrees that now belong to left. Detach its children first; when
+		// right is shared (copy-on-write, rc > 0) also drop the references
+		// it held so each subtree keeps exactly one reference via left.
+		shared := right.rc.Load() > 0
+		if !right.leaf() {
+			for j := 0; j < right.len+1; j++ {
+				child := right.branch.children[j]
+				right.branch.children[j] = nil
+				if shared {
+					t.releaseNode(child)
+				}
+			}
+			for j := range right.branch.counts {
+				right.branch.counts[j] = 0
+			}
+		}
+		right.len = 0
+		t.releaseNode(right)
 	} else if left.len > right.len {
 		// move left -> right over one slot
 
