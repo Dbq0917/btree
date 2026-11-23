@@ -27,7 +27,9 @@ func NewSet[K cmp.Ordered]() *Set[K] {
 	return new(Set[K])
 }
 
-// Insert a key
+// Insert a key.
+// Keys inserted in ascending order automatically use an optimized
+// bulk-load append path.
 func (b *Set[K]) Insert(key K) bool {
 	_, inserted := b.base.Insert(key, omit{})
 	return inserted

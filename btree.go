@@ -656,6 +656,17 @@ func (t *tree[K, V]) BackMut() (K, V, bool) {
 	return t.back0(true)
 }
 
+// gtBack returns true when the key-value pair is ordered after the current
+// maximum item in the tree. This is a read-only operation used to detect
+// append-style bulk loads at the insert entry points.
+func (t *tree[K, V]) gtBack(key K, value V) bool {
+	n := t.root
+	for !n.leaf() {
+		n = n.branch.children[n.len]
+	}
+	return t.dataCompare(key, value, n.keys[n.len-1], n.values[n.len-1]) > 0
+}
+
 func (t *tree[K, V]) Height() int {
 	if t.count == 0 {
 		return 0
@@ -845,6 +856,11 @@ func (t *tree[K, V]) Insert(key K, value V) (V, bool) {
 		t.insertFirstItem(key, value)
 		return emptyValue, true
 	}
+	if t.dataCompare != nil && t.gtBack(key, value) {
+		// Fast path for bulk loading items in ascending order.
+		t.PushBack(key, value)
+		return emptyValue, true
+	}
 	t.cowRoot(true)
 	t.ensureRoot()
 	current, inserted := t.nodeInsert(t.root, key, value)
@@ -899,6 +915,11 @@ func (t *tree[K, V]) Set(key K, value V) (V, bool) {
 	var emptyValue V
 	if t.count == 0 {
 		t.insertFirstItem(key, value)
+		return emptyValue, false
+	}
+	if t.dataCompare != nil && t.gtBack(key, value) {
+		// Fast path for bulk loading items in ascending order.
+		t.PushBack(key, value)
 		return emptyValue, false
 	}
 	t.cowRoot(true)

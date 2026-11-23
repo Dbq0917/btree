@@ -122,6 +122,8 @@ func (b *Map[K, V]) init() {
 
 // Insert new item.
 // Returns true if inserted or false if already exists.
+// Items inserted in ascending key order automatically use an optimized
+// bulk-load append path.
 func (b *Map[K, V]) Insert(key K, value V) (V, bool) {
 	b.init()
 	if b.tree.alt {
@@ -144,6 +146,8 @@ func (b *Map[K, V]) Replace(key K, value V) (V, bool) {
 
 // Set inserts or replaces item.
 // Returns true if replaced or false if inserted
+// Items inserted in ascending key order automatically use an optimized
+// bulk-load append path.
 func (b *Map[K, V]) Set(key K, value V) (V, bool) {
 	b.init()
 	if b.tree.alt {
@@ -609,6 +613,17 @@ more:
 // map specific operations
 ////////////////////////////////////////////////////////////////////////////////
 
+// gtBack returns true when the key is ordered after the current maximum key
+// in the map. This is a read-only operation used to detect append-style bulk
+// loads at the insert entry points.
+func (b *Map[K, V]) gtBack(key K) bool {
+	n := b.tree.root
+	for !n.leaf() {
+		n = n.branch.children[n.len]
+	}
+	return key > n.keys[n.len-1]
+}
+
 func (b *Map[K, V]) nodeInsert(n *node[K, V], key K, value V) (V, int) {
 	var emptyValue V
 	// only branch nodes are reachable here
@@ -668,6 +683,11 @@ func (b *Map[K, V]) insert(key K, value V) (V, bool) {
 	}
 	b.tree.ensureRoot()
 	if !b.tree.root.leaf() {
+		if b.gtBack(key) {
+			// Fast path for bulk loading items in ascending order.
+			b.tree.PushBack(key, value)
+			return emptyValue, true
+		}
 		current, inserted := b.nodeInsert(b.tree.root, key, value)
 		b.tree.count += inserted
 		return current, inserted == 1
@@ -753,6 +773,11 @@ func (b *Map[K, V]) strInsert(key K, value V) (V, bool) {
 	var emptyValue V
 	if b.tree.count == 0 {
 		b.tree.insertFirstItem(key, value)
+		return emptyValue, true
+	}
+	if b.tree.gtBack(key, value) {
+		// Fast path for bulk loading items in ascending order.
+		b.tree.PushBack(key, value)
 		return emptyValue, true
 	}
 	b.tree.cowRoot(true)
@@ -893,6 +918,11 @@ func (b *Map[K, V]) set(key K, value V) (V, bool) {
 	}
 	b.tree.ensureRoot()
 	if !b.tree.root.leaf() {
+		if b.gtBack(key) {
+			// Fast path for bulk loading items in ascending order.
+			b.tree.PushBack(key, value)
+			return emptyValue, false
+		}
 		current, inserted := b.nodeSet(b.tree.root, key, value)
 		b.tree.count += inserted
 		return current, inserted == 0
@@ -942,6 +972,11 @@ func (b *Map[K, V]) strSet(key K, value V) (V, bool) {
 	var emptyValue V
 	if b.tree.count == 0 {
 		b.tree.insertFirstItem(key, value)
+		return emptyValue, false
+	}
+	if b.tree.gtBack(key, value) {
+		// Fast path for bulk loading items in ascending order.
+		b.tree.PushBack(key, value)
 		return emptyValue, false
 	}
 	b.tree.cowRoot(true)

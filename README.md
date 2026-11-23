@@ -995,6 +995,7 @@ The btree package has various optimizations that enhance performance over existi
 - Branch node counting
 - Branch string prefixing
 - Auto-detected search method
+- Auto-detected bulk loading (ascending inserts use an append fast path)
 - Separate keys and values for maps
 - Last-first search algo. (fast bounds check, fewer conditions, fast bulk loads)
 - Reference counted COW

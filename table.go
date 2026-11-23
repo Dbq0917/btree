@@ -135,6 +135,9 @@ func (b *Table[T]) init() bool {
 	return b.tree.dataCompare != nil
 }
 
+// Insert an item.
+// Items inserted in ascending order automatically use an optimized
+// bulk-load append path.
 func (b *Table[T]) Insert(item T) (T, bool) {
 	var empty T
 	if !b.init() {
@@ -147,6 +150,9 @@ func (b *Table[T]) Replace(item T) (T, bool) {
 	return b.tree.Replace(omit{}, item)
 }
 
+// Set inserts or replaces an item.
+// Items inserted in ascending order automatically use an optimized
+// bulk-load append path.
 func (b *Table[T]) Set(item T) (T, bool) {
 	var empty T
 	if !b.init() {
