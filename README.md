@@ -11,6 +11,7 @@ An efficient [B-tree](https://en.wikipedia.org/wiki/B-tree) for Go.
 - Adopts Go [generic collection types](https://github.com/golang/go/issues/80590), `_Abstract(Collection/Map/Set)`
 - All data operations are [O(log n)](https://en.wikipedia.org/wiki/Time_complexity#Logarithmic_time) complexity
 - Instant copy-on-write (shadow clones), providing O(1) snapshots
+- Grouped write transactions that reuse copied nodes across a batch
 - Uses [btree counting](https://www.chiark.greenend.org.uk/~sgtatham/algorithms/cbtree.html) for O(log n) random access
 - Exhaustively tested code with 100% coverage
 - Optimized for [high performance](#performance) and low memory
@@ -160,6 +161,25 @@ func main() {
 // user:4 Andrea
 // user:6 Andy
 ```
+
+### Write transactions
+
+`Begin` creates a private copy-on-write view for a batch of writes. The first
+write to a shared path copies that path once, and every later write in the same
+transaction reuses those nodes.
+
+```go
+tx := users.Begin()
+tx.Set("user:7", "Marta")
+tx.Set("user:8", "Noah")
+if err := tx.Commit(); err != nil {
+	log.Fatal(err)
+}
+```
+
+Calling `Rollback` instead of `Commit` releases the private view and leaves the
+original map unchanged. `Map`, `Set`, and `Table` all provide the same
+transaction API.
 
 <!---------------------------------------------------------------------------
 -- Set

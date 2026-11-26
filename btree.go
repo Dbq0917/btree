@@ -27,6 +27,7 @@ type tree[K, V any] struct {
 	alt         bool        // flag used by outer types
 	initd       bool        // flag used by outer types
 	count       int         // total tree count
+	copies      int         // number of nodes copied by copy-on-write
 	root        *node[K, V] // root node
 	dataCopy    func(V) V   // Value data copy-on-write
 	dataRelease func(V)     // Value data on release
@@ -217,6 +218,7 @@ func (t *tree[K, V]) releaseNode(n *node[K, V]) {
 }
 
 func (t *tree[K, V]) copyNode(n *node[K, V]) *node[K, V] {
+	t.copies++
 	n2 := t.newNode(n.leaf())
 	n2.len = n.len
 	copy(n2.keys[:], n.keys[:n.len])
@@ -681,6 +683,7 @@ func (t *tree[K, V]) Clear() {
 func (t *tree[K, V]) CloneInto(t2 *tree[K, V]) {
 	t.cloned = true
 	*t2 = *t
+	t2.copies = 0
 	if t.root != nil {
 		t.root.rc.Add(1)
 	}
