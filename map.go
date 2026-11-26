@@ -115,15 +115,15 @@ func (b *Map[K, V]) init0() {
 // should inline
 func (b *Map[K, V]) init() {
 	// Called from Insert, InsertAt, Set, PushFront, PushBack
-	if !b.tree.initd {
-		b.init0()
-	}
+	b.tree.initialize(b.init0)
 }
 
 // Insert new item.
 // Returns true if inserted or false if already exists.
 func (b *Map[K, V]) Insert(key K, value V) (V, bool) {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.alt {
 		return b.altInsert(key, value)
 	} else {
@@ -135,6 +135,8 @@ func (b *Map[K, V]) Insert(key K, value V) (V, bool) {
 // Returns true if replaced, of false if not exists.
 func (b *Map[K, V]) Replace(key K, value V) (V, bool) {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.alt {
 		return b.altReplace(key, value)
 	} else {
@@ -146,6 +148,8 @@ func (b *Map[K, V]) Replace(key K, value V) (V, bool) {
 // Returns true if replaced or false if inserted
 func (b *Map[K, V]) Set(key K, value V) (V, bool) {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.alt {
 		return b.altSet(key, value)
 	} else {
@@ -156,6 +160,9 @@ func (b *Map[K, V]) Set(key K, value V) (V, bool) {
 
 // Delete item from map.
 func (b *Map[K, V]) Delete(key K) (V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.alt {
 		return b.altDelete(key)
 	} else {
@@ -165,6 +172,9 @@ func (b *Map[K, V]) Delete(key K) (V, bool) {
 
 // Contains returns true if item exists
 func (b *Map[K, V]) Contains(key K) bool {
+	view, lease := b.tree.readView()
+	defer lease.End()
+	b = &Map[K, V]{tree: view}
 	if b.tree.count == 0 {
 		return false
 	}
@@ -191,6 +201,9 @@ func (b *Map[K, V]) Contains(key K) bool {
 // Lookup an item
 // Returns true if found or false if not found
 func (b *Map[K, V]) Lookup(key K) (V, bool) {
+	view, lease := b.tree.readView()
+	defer lease.End()
+	b = &Map[K, V]{tree: view}
 	if b.tree.alt {
 		return b.altLookup(key)
 	} else {
@@ -202,6 +215,9 @@ func (b *Map[K, V]) Lookup(key K) (V, bool) {
 // Returns true if found or false if not found
 // MUTABLE OPERATION
 func (b *Map[K, V]) LookupMut(key K) (V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.alt {
 		return b.altLookupMut(key)
 	} else {
@@ -236,6 +252,9 @@ const (
 func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 	var emptyKey K
 	var emptyValue V
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	if b.tree.count == 0 || action == nil {
 		return
 	}
@@ -275,7 +294,11 @@ func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 						}
 					} else {
 						// fallback to standard deletion
-						b.Delete(key)
+						if b.tree.alt {
+							b.altDelete(key)
+						} else {
+							b.delete(key)
+						}
 					}
 				}
 				return
@@ -294,34 +317,57 @@ func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 // Ascend returns an iterator starting at key
 func (b *Map[K, V]) Ascend(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.Ascend(key, emptyValue)
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.Ascend(key, emptyValue)(yield)
+	}
 }
 
 // AscendMut returns an iterator starting at key
 // MUTABLE OPERATION
 func (b *Map[K, V]) AscendMut(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.AscendMut(key, emptyValue)
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.AscendMut(key, emptyValue)(yield)
+	}
 }
 
 // Len returns the number of items in map
 func (b *Map[K, V]) Len() int {
-	return b.tree.Len()
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.count
 }
 
 // Clear the map
 func (b *Map[K, V]) Clear() {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
+	oldRoot := b.tree.root
 	b.tree.Clear()
+	if oldRoot != nil {
+		b.tree.pendingRoots = append(b.tree.pendingRoots, oldRoot)
+	}
 }
 
 // Release clears the map and release any references.
 // This method is functionally equivalent to Clear() but is an optimization for
 // collections that are cloned.
 func (b *Map[K, V]) Release() {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	b.tree.Release()
 }
 
 func (b *Map[K, V]) cloneInto(b2 *Map[K, V]) {
+	unlock := b.tree.lockWrite()
+	defer unlock()
 	*b2 = *b
 	b.tree.CloneInto(&b2.tree)
 }
@@ -339,6 +385,9 @@ func (b *Map[K, V]) Clone() *Map[K, V] {
 // Returns the deleted items as an ordered extract that can be iterated over.
 func (b *Map[K, V]) DrainAtOptions(index, count int, opts DrainOptions,
 ) Extract2[K, V] {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.DrainAt(index, count, opts)
 }
 
@@ -347,6 +396,9 @@ func (b *Map[K, V]) DrainAtOptions(index, count int, opts DrainOptions,
 // Returns the deleted items as an ordered extract that can be iterated over.
 func (b *Map[K, V]) DrainOptions(min, max K, opts DrainOptions) Extract2[K, V] {
 	var emptyValue V
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.Drain(min, emptyValue, max, emptyValue, opts)
 }
 
@@ -367,210 +419,315 @@ func (b *Map[K, V]) Drain(min, max K) Extract2[K, V] {
 // Decend returns an iterator with items less than key, in reverse order.
 func (b *Map[K, V]) Descend(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.Descend(key, emptyValue)
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.Descend(key, emptyValue)(yield)
+	}
 }
 
 // DescendMut returns an iterator with items less than key, in reverse order.
 // MUTABLE OPERATION
 func (b *Map[K, V]) DescendMut(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.DescendMut(key, emptyValue)
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.DescendMut(key, emptyValue)(yield)
+	}
 }
 
 // IndexOf returns the index of key
 func (b *Map[K, V]) IndexOf(key K) (int, bool) {
 	var emptyValue V
-	return b.tree.IndexOf(key, emptyValue)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return (&Map[K, V]{tree: view}).tree.IndexOf(key, emptyValue)
 }
 
 // All returns an iterator of all items in map.
 func (b *Map[K, V]) All() iter.Seq2[K, V] {
-	return b.tree.All()
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.All()(yield)
+	}
 }
 
 // AllMut returns an iterator of all items in map.
 // MUTABLE OPERATION
 func (b *Map[K, V]) AllMut() iter.Seq2[K, V] {
-	return b.tree.AllMut()
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.AllMut()(yield)
+	}
 }
 
 // Backward returns an iterator of all items in map, in reverse order.
 func (b *Map[K, V]) Backward() iter.Seq2[K, V] {
-	return b.tree.Backward()
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.Backward()(yield)
+	}
 }
 
 // BackwardMut returns an iterator of all items in map, in reverse order.
 // MUTABLE OPERATION
 func (b *Map[K, V]) BackwardMut() iter.Seq2[K, V] {
-	return b.tree.BackwardMut()
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.BackwardMut()(yield)
+	}
 }
 
 // AscendAt returns an iterator starting at index
 func (b *Map[K, V]) AscendAt(index int) iter.Seq2[K, V] {
-	return b.tree.AscendAt(index)
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.AscendAt(index)(yield)
+	}
 }
 
 // AscendAtMut returns an iterator starting at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) AscendAtMut(index int) iter.Seq2[K, V] {
-	return b.tree.AscendAtMut(index)
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.AscendAtMut(index)(yield)
+	}
 }
 
 // DescendAt returns an iterator starting at index, in reverse order
 func (b *Map[K, V]) DescendAt(index int) iter.Seq2[K, V] {
-	return b.tree.DescendAt(index)
+	return func(yield func(K, V) bool) {
+		view, lease := b.tree.readView()
+		defer lease.End()
+		(&Map[K, V]{tree: view}).tree.DescendAt(index)(yield)
+	}
 }
 
 // DescendAtMut returns an iterator starting at index, in reverse order
 // MUTABLE OPERATION
 func (b *Map[K, V]) DescendAtMut(index int) iter.Seq2[K, V] {
-	return b.tree.DescendAtMut(index)
+	return func(yield func(K, V) bool) {
+		b.init()
+		endWrite := b.tree.beginWrite()
+		defer endWrite()
+		b.tree.DescendAtMut(index)(yield)
+	}
 }
 
 // PushFront insertes item to front of map.
 func (b *Map[K, V]) PushFront(key K, value V) bool {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PushFront(key, value)
 }
 
 // PushBack insertes item to back of map.
 func (b *Map[K, V]) PushBack(key K, value V) bool {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PushBack(key, value)
 }
 
 // PopFront removes first item.
 func (b *Map[K, V]) PopFront() (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PopFront()
 }
 
 // PopBack removes last item.
 func (b *Map[K, V]) PopBack() (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PopBack()
 }
 
 // PopFrontFunc removes first item if provided function allows.
 func (b *Map[K, V]) PopFrontFunc(cond func(key K, value V) bool) (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PopFrontFunc(cond)
 }
 
 // PopBackFunc removes last item if provided function allows.
 func (b *Map[K, V]) PopBackFunc(cond func(key K, value V) bool) (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.PopBackFunc(cond)
 }
 
 // Front returns first item
 func (b *Map[K, V]) Front() (K, V, bool) {
-	return b.tree.Front()
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.Front()
 }
 
 // Back returns first item
 func (b *Map[K, V]) Back() (K, V, bool) {
-	return b.tree.Back()
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.Back()
 }
 
 // Front returns first item
 func (b *Map[K, V]) FrontMut() (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.FrontMut()
 }
 
 // BackMut returns first item
 // MUTABLE OPERATION
 func (b *Map[K, V]) BackMut() (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.BackMut()
 }
 
 // InsertAt inserts item at index
 func (b *Map[K, V]) InsertAt(index int, key K, value V) bool {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.InsertAt(index, key, value)
 }
 
 // DeleteAt deletes item at index
 func (b *Map[K, V]) DeleteAt(index int) (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.DeleteAt(index)
 }
 
 // ReplaceAt replaces item at index
 func (b *Map[K, V]) ReplaceAt(index int, key K, value V) (K, V, bool) {
 	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.ReplaceAt(index, key, value)
 }
 
 // LookupAt returns item at index
 func (b *Map[K, V]) LookupAt(index int) (K, V, bool) {
-	return b.tree.LookupAt(index)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.LookupAt(index)
 }
 
 // LookupAtMut returns item at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) LookupAtMut(index int) (K, V, bool) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.LookupAtMut(index)
 }
 
 // GetAt returns item at index
 func (b *Map[K, V]) GetAt(index int) (K, V) {
-	return b.tree.GetAt(index)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.GetAt(index)
 }
 
 // GetAtMut returns item at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) GetAtMut(index int) (K, V) {
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.GetAtMut(index)
 }
 
 // Keys returns an iterator of all keys.
 func (b *Map[K, V]) Keys() iter.Seq[K] {
-	return iterK(b.tree.All())
+	return iterK(b.All())
 }
 
 // Values returns an iterator of all values.
 func (b *Map[K, V]) Values() iter.Seq[V] {
-	return iterV(b.tree.All())
+	return iterV(b.All())
 }
 
 // ValuesMut returns an iterator of all values.
 // MUTABLE OPERATION
 func (b *Map[K, V]) ValuesMut() iter.Seq[V] {
-	return iterV(b.tree.AllMut())
+	return iterV(b.AllMut())
 }
 
 // Seek returns the first item that is >= key
 func (b *Map[K, V]) Seek(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.Seek(key, emptyValue)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.Seek(key, emptyValue)
 }
 
 // SeekMut returns the first item that is >= key
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekMut(key K) (K, V, bool) {
 	var emptyValue V
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.SeekMut(key, emptyValue)
 }
 
 // SeekNext returns the first item that is > key
 func (b *Map[K, V]) SeekNext(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.SeekNext(key, emptyValue)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.SeekNext(key, emptyValue)
 }
 
 // SeekNextMut returns the first item that is > key
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekNextMut(key K) (K, V, bool) {
 	var emptyValue V
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.SeekNextMut(key, emptyValue)
 }
 
 // SeekPrev returns the first item that is < key
 func (b *Map[K, V]) SeekPrev(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.SeekPrev(key, emptyValue)
+	view, lease := b.tree.readView()
+	defer lease.End()
+	return view.SeekPrev(key, emptyValue)
 }
 
 // SeekPrevMut returns the first item that is < key
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekPrevMut(key K) (K, V, bool) {
 	var emptyValue V
+	b.init()
+	endWrite := b.tree.beginWrite()
+	defer endWrite()
 	return b.tree.SeekPrevMut(key, emptyValue)
 }
 
@@ -625,7 +782,7 @@ func (b *Map[K, V]) nodeInsert(n *node[K, V], key K, value V) (V, int) {
 			goto foundInBranch
 		}
 	}
-	if b.tree.cloned {
+	if b.tree.cloned || b.tree.rcuWrite {
 		b.tree.cowChild(n, i, true)
 	}
 	if b.tree.ensureBranch(n, i) {
@@ -663,7 +820,7 @@ func (b *Map[K, V]) insert(key K, value V) (V, bool) {
 		b.tree.insertFirstItem(key, value)
 		return emptyValue, true
 	}
-	if b.tree.cloned {
+	if b.tree.cloned || b.tree.rcuWrite {
 		b.tree.cowRoot(true)
 	}
 	b.tree.ensureRoot()
@@ -846,7 +1003,7 @@ func (b *Map[K, V]) nodeSet(n *node[K, V], key K, value V) (V, int) {
 			goto foundInBranch
 		}
 	}
-	if b.tree.cloned {
+	if b.tree.cloned || b.tree.rcuWrite {
 		b.tree.cowChild(n, i, true)
 	}
 	if b.tree.ensureBranch(n, i) {
@@ -888,7 +1045,7 @@ func (b *Map[K, V]) set(key K, value V) (V, bool) {
 		b.tree.insertFirstItem(key, value)
 		return emptyValue, false
 	}
-	if b.tree.cloned {
+	if b.tree.cloned || b.tree.rcuWrite {
 		b.tree.cowRoot(true)
 	}
 	b.tree.ensureRoot()

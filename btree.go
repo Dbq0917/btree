@@ -20,18 +20,34 @@ const maxItems = fanout - 1
 const minItems = maxItems / 2
 
 type tree[K, V any] struct {
+	writeOwner  uint64      // goroutine ID owning the reentrant write lock
+	writeDepth  int         // reentrant write depth for the owner
 	cloned      bool        // Clone() called at least once during life of tree.
 	strpre      bool        // Use string prefixes, K _MUST_ be a string.
 	nopre       bool        // flag used by outer types
 	stdops      bool        // flag used by outer types
 	alt         bool        // flag used by outer types
 	initd       bool        // flag used by outer types
+	initState   uint32      // atomic publication of one-time initialization
 	count       int         // total tree count
 	root        *node[K, V] // root node
 	dataCopy    func(V) V   // Value data copy-on-write
 	dataRelease func(V)     // Value data on release
 	dataCompare func(K, V, K, V) int
 	dataSearch  func(int, *K, *V, K, V) (int, bool)
+
+	// pub is the atomically published publication[K, V]. Writers use root and
+	// count as private working state and publish a new publication once the
+	// complete tree is ready.
+	pub unsafe.Pointer
+
+	// writeMu guards root, count, rcuWrite, and pendingRoots. It is stored as
+	// an opaque pointer so tree values remain safe to copy in CloneInto.
+	writeMu      unsafe.Pointer
+	rcuWrite     bool
+	pendingRoots []*node[K, V]
+	claimedRoot  *node[K, V]
+	claimBase    int64
 }
 
 type node[K, V any] struct {
@@ -254,14 +270,38 @@ func (t *tree[K, V]) cow0(pn **node[K, V]) {
 
 // should inline
 func (t *tree[K, V]) cowRoot(mut bool) {
-	if mut && t.cloned && t.root != nil && t.root.rc.Load() > 0 {
+	if !mut || t.root == nil {
+		return
+	}
+	if t.rcuWrite {
+		if t.root == t.claimedRoot && t.claimBase == 0 {
+			// No clone or reader reference existed when the write claimed the
+			// root, and the claim prevents new readers from acquiring it.
+			// Mutating this private root in place is safe.
+			return
+		}
+		if t.root != t.claimedRoot && t.root.rc.Load() == 0 {
+			return
+		}
+		// Readers or clones may still point at the old root. Copy it and keep
+		// it alive until after the replacement publication. endWrite releases
+		// pendingRoots after the atomic root swap.
+		old := t.root
+		t.root = t.copyNode(old)
+		t.pendingRoots = append(t.pendingRoots, old)
+		return
+	}
+	if t.cloned && t.root.rc.Load() > 0 {
 		t.cow0(&t.root)
 	}
 }
 
 // should inline
 func (t *tree[K, V]) cowChild(n *node[K, V], i int, mut bool) {
-	if mut && t.cloned && n.branch.children[i].rc.Load() > 0 {
+	if !mut || n == nil || n.branch == nil || n.branch.children[i] == nil {
+		return
+	}
+	if (t.rcuWrite || t.cloned) && n.branch.children[i].rc.Load() > 0 {
 		t.cow0(&n.branch.children[i])
 	}
 }
@@ -681,16 +721,33 @@ func (t *tree[K, V]) Clear() {
 func (t *tree[K, V]) CloneInto(t2 *tree[K, V]) {
 	t.cloned = true
 	*t2 = *t
+	t2.writeMu = nil
+	t2.writeOwner = 0
+	t2.writeDepth = 0
+	t2.rcuWrite = false
+	t2.pendingRoots = nil
+	t2.claimedRoot = nil
+	t2.claimBase = 0
 	if t.root != nil {
 		t.root.rc.Add(1)
 	}
+	atomic.StorePointer(&t2.pub, unsafe.Pointer(&publication[K, V]{
+		root:  t2.root,
+		count: t2.count,
+	}))
 }
 
 func (t *tree[K, V]) Release() {
-	if t.root != nil {
-		t.releaseNode(t.root)
-	}
+	root := t.root
 	t.Clear()
+	if root == nil {
+		return
+	}
+	if t.rcuWrite {
+		t.pendingRoots = append(t.pendingRoots, root)
+	} else {
+		t.releaseNode(root)
+	}
 }
 
 func (t *tree[K, V]) gte(ak K, av V, bk K, bv V) bool {
