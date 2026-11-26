@@ -902,6 +902,7 @@ It also inherits the [Table](#table) collection, allowing for
 
 ```py
 Push(item)     # Insert item into queue.
+Update(old, new) # Replace an item, keeping its original queue position.
 Pop()          # Remove the largest item.
 Front()        # Get the largest item.
 PopFunc(cond)  # Remove largest item if cond returns true.

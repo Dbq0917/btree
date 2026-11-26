@@ -129,6 +129,38 @@ func (b *Prique[T]) Delete(key T) (T, bool) {
 	return empty, false
 }
 
+// Update replaces the oldest item that matches oldKey with newItem while
+// keeping the item's original sequence number. This allows the item's priority
+// to change without disturbing the order of other items that compare equally.
+// Returns the previous item and true if an item was updated.
+func (b *Prique[T]) Update(oldKey, newItem T) (T, bool) {
+	var empty T
+	keyA := pqitem[T]{oldKey, 0}
+	v, ok := b.table.Seek(keyA)
+	if !ok {
+		return empty, false
+	}
+	keyB := pqitem[T]{v.value, 0}
+	if b.table.tree.dataCompare(omit{}, keyA, omit{}, keyB) != 0 {
+		return empty, false
+	}
+	oldItem := pqitem[T]{oldKey, v.seqid}
+	item := pqitem[T]{newItem, v.seqid}
+	if b.table.tree.dataCompare(omit{}, oldItem, omit{}, item) == 0 {
+		old, ok := b.table.Replace(item)
+		if !ok {
+			return empty, false
+		}
+		return old.value, true
+	}
+	old, ok := b.table.Delete(v)
+	if !ok {
+		return empty, false
+	}
+	b.table.Insert(item)
+	return old.value, true
+}
+
 // Pop next item from queue.
 func (b *Prique[T]) Pop() (T, bool) {
 	v, ok := b.table.PopBack()

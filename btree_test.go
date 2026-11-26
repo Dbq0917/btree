@@ -4049,6 +4049,88 @@ func TestPrique(t *testing.T) {
 	t.Run("opts3", func(t *testing.T) { testPrique(t, 3) })
 }
 
+func TestPriqueUpdate(t *testing.T) {
+	type task struct {
+		key int `btree:"key"`
+		id  string
+	}
+
+	t.Run("reorder", func(t *testing.T) {
+		var q Prique[task]
+		q.Push(task{10, "low"})
+		q.Push(task{20, "mid"})
+		q.Push(task{30, "high"})
+
+		old, ok := q.Update(task{key: 20}, task{40, "mid"})
+		assert(ok && old == (task{20, "mid"}))
+		assert(q.Len() == 3)
+		assert(slices.Equal(slices.Collect(q.All()), []task{
+			{40, "mid"},
+			{30, "high"},
+			{10, "low"},
+		}))
+	})
+
+	t.Run("ties", func(t *testing.T) {
+		var q Prique[task]
+		q.Push(task{20, "a"})
+		q.Push(task{20, "b"})
+		q.Push(task{20, "c"})
+
+		old, ok := q.Update(task{key: 20}, task{30, "a"})
+		assert(ok && old == (task{20, "a"}))
+		assert(slices.Equal(slices.Collect(q.All()), []task{
+			{30, "a"},
+			{20, "c"},
+			{20, "b"},
+		}))
+
+		old, ok = q.Update(task{key: 30}, task{20, "a"})
+		assert(ok && old == (task{30, "a"}))
+		assert(slices.Equal(slices.Collect(q.All()), []task{
+			{20, "c"},
+			{20, "b"},
+			{20, "a"},
+		}))
+	})
+
+	t.Run("same-order", func(t *testing.T) {
+		var q Prique[task]
+		q.Push(task{20, "a"})
+		q.Push(task{10, "b"})
+
+		old, ok := q.Update(task{20, "a"}, task{20, "a2"})
+		assert(ok && old == (task{20, "a"}))
+		item, ok := q.Front()
+		assert(ok && item == (task{20, "a2"}))
+	})
+
+	t.Run("not-found", func(t *testing.T) {
+		var q Prique[task]
+		q.Push(task{20, "a"})
+		old, ok := q.Update(task{key: 10}, task{10, "b"})
+		assert(!ok && old == (task{}))
+		assert(q.Len() == 1)
+	})
+
+	t.Run("less-option", func(t *testing.T) {
+		q := NewPriqueOptions(PriqueOptions[task]{
+			Less: func(a, b task) bool { return a.key < b.key },
+		})
+		q.Push(task{20, "a"})
+		q.Push(task{20, "b"})
+		q.Push(task{20, "c"})
+
+		old, ok := q.Update(task{key: 20}, task{10, "a"})
+		assert(ok && old == (task{20, "a"}))
+		assert(slices.Equal(slices.Collect(q.All()), []task{
+			{20, "c"},
+			{20, "b"},
+			{10, "a"},
+		}))
+	})
+}
+
 func TestDeque(t *testing.T) {
 	seed := uint64(time.Now().UnixNano())
 	t.Logf("seed: %d", seed)
